@@ -1,0 +1,383 @@
+/* eslint-disable prettier/prettier */
+const { AuthenticationError } = require('apollo-server-express');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const AppError = require('../utils/appError');
+const User = require('../models/userModel');
+const Email = require('./../utils/email');
+const { protect, restricsTo } = require('./helpers');
+const userController = require('./../controllers/userController');
+const tourController = require('./../controllers/tourController');
+const reviewController = require('./../controllers/reviewController');
+const bookingController = require('./../controllers/bookingController');
+
+const signToken = id => {
+    return jwt.sign({ id }, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN
+    });
+  };
+
+const createSendToken = (user, statusCode, res) => {
+    const token = signToken(user._id);
+    const cookieOptions = {
+      expires: new Date(
+        Date.now() + process.env.JWT_COOKIE_EXPIRES_IN * 24 * 60 * 60 * 1000
+      ),
+      httpOnly: true
+    };
+    if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
+  
+    res.cookie('jwt', token, cookieOptions);
+  
+    // Remove password from output
+    user.password = undefined;
+  };
+
+const Mutation = {
+    // =========================AUTH============================
+
+    login: async (parent, args, { req, res }, info) => {
+        try{
+            // const currentUser = await protect(req, res);
+            const { email, password } = args;
+
+            if (!email || !password) {
+                throw new AppError('Please provide email and password!', 400);
+            }
+            // 2) Check if user exists && password is correct
+            const user = await User.findOne({ email }).select('+password');
+        
+            if (!user || !(await user.correctPassword(password, user.password))) {
+                throw new AuthenticationError('Incorrect email or password', 401);
+            }
+        
+            // 3) If everything ok, send token to client
+            createSendToken(user, 200, res);
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    signup: async (parent, { name, email, password, passwordConfirm }, { req, res }, info) => {
+        const newUser = await User.create({
+            name: name,
+            email: email,
+            password: password,
+            passwordConfirm: passwordConfirm
+        });
+        
+        const url = `${req.protocol}://${req.get('host')}/me`;
+        // await new Email(newUser, url).sendWelcome();
+
+        createSendToken(newUser, 201, res);
+
+        return newUser;
+    },
+
+    logout: (parent, args, { res }, info) => {
+        res.cookie('jwt', 'loggedout', {
+            expires: new Date(Date.now() + 10 * 1000),
+            httpOnly: true
+        });
+
+        return true;
+    },
+
+    forgotPassword: async (parent, { email }, { req, res }, info) => {
+        // 1) Get user based on POSTed email
+        const user = await User.findOne({ email: email });
+
+        if (!user) {
+            throw new AppError('There is no user with email address.', 404);
+        }
+
+        // 2) Generate the random reset token
+        const resetToken = user.createPasswordResetToken();
+        await user.save({ validateBeforeSave: false });
+
+        // 3) Send it to user's email
+        try {
+            const resetURL = `${req.protocol}://${req.get(
+            'host'
+            )}/api/v1/users/resetPassword/${resetToken}`;
+            // await new Email(user, resetURL).sendPasswordReset();
+
+            return resetToken;
+        } catch (err) {
+            user.passwordResetToken = undefined;
+            user.passwordResetExpires = undefined;
+            await user.save({ validateBeforeSave: false });
+
+            throw new AppError('There was an error sending the email. Try again later!');
+        }
+    },
+
+    resetPassword: async (parent, { passwordConfirm, password, token }, { res }, info) => {
+        // 1) Get user based on the token
+        const hashedToken = crypto
+            .createHash('sha256')
+            .update(token)
+            .digest('hex');
+
+        const user = await User.findOne({
+            passwordResetToken: hashedToken,
+            passwordResetExpires: { $gt: Date.now() }
+        });
+
+        // 2) If token has not expired, and there is user, set the new password
+        if (!user) {
+            throw new AppError('Token is invalid or has expired', 400);
+        }
+        user.password = password;
+        user.passwordConfirm = passwordConfirm;
+        user.passwordResetToken = undefined;
+        user.passwordResetExpires = undefined;
+        await user.save();
+
+        // 3) Update changedPasswordAt property for the user
+        // 4) Log the user in, send JWT
+        createSendToken(user, 200, res);
+
+        return user;
+    },
+
+    updatePassword: async (parent, { password, passwordConfirm, passwordCurrent}, { req, res }, info) => {
+        try {
+            const currentUser = await protect(req, res);
+
+            // 1) Get user from collection
+            const user = await User.findById(currentUser.id).select('+password');
+
+            // 2) Check if POSTed current password is correct
+            if (!(await user.correctPassword(passwordCurrent, user.password))) {
+                throw new AppError('Your current password is wrong.', 401);
+            }
+
+            // 3) If so, update password
+            user.password = password;
+            user.passwordConfirm = passwordConfirm;
+            await user.save();
+            // User.findByIdAndUpdate will NOT work as intended!
+
+            // 4) Log user in, send JWT
+            createSendToken(user, 200, res);
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err
+        }
+    },
+
+    // =========================USERS============================
+
+    updateMe: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            // userController.uploadUserPhoto();
+            // req.file = args.photo;
+            // userController.resizeUserPhoto(req);
+            const user = await userController.updateMe(req, args);
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    deleteMe: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+
+            const user = await userController.deleteMe(req);
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    createUser: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin']);
+
+            const user = userController.createUser();
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+    
+    updateUser: async (parent, { id, ...body}, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin']);
+
+            const user = userController.updateUser({id, body})
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+    
+    deleteUser: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin']);
+
+            const user = userController.deleteUser(args)
+
+            return user;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    // =========================TOURS============================
+
+    createTour: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const tour = tourController.createTour(args)
+
+            return tour;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+    
+    updateTour: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const { id, ...body } = args
+            const tour = tourController.updateTour({ id, body })
+
+            return tour;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    deleteTour: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const tour = tourController.deleteTour(args)
+
+            return tour;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    // =========================REVIEWS============================
+
+    createReview: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['user']);
+
+            const review = reviewController.createReview(args)
+
+            return review;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    updateReview: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'user']);
+
+            const { id, ...body } = args
+            const review = reviewController.updateReview({ id, body })
+
+            return review;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    deleteReview: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'user']);
+
+            const review = reviewController.deleteReview(args)
+
+            return review;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    // =========================BOOKINGS============================
+
+    createBooking: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const booking = bookingController.createBooking(args)
+
+            return booking;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+    
+    updateBooking: async (parent, { args }, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const { id, ...body } = args
+            const booking = bookingController.updateBooking({ id, body })
+
+            return booking;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+
+    deleteBooking: async (parent, args, { req, res }, info) => {
+        try {
+            await protect(req, res);
+            restricsTo(req, ['admin', 'lead-guide']);
+
+            const booking = bookingController.deleteBooking(args)
+
+            return booking;
+        } catch(err) {
+            console.error(err);
+            return err;
+        }
+    },
+};
+
+module.exports = Mutation;
